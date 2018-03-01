@@ -244,3 +244,166 @@ _el1_start:
 > ARM的内核地址空间一般是高内存地址空间，但是实际上并不存在那么大的物理内存空间，所以也不能在装入内核时试图直接将内核装入在高内存位置（因为也不存在类似于MIPS的直接映射区域），这种时候你需要自己设计一种解决方案，使得内核能够“正确”链接，并在MMU启动后能够在高地址空间可运行。如果你不能做到这个方案也无妨接下来的实验，你也可以直接将使用`TTBR0_EL1`作为内核用的地址空间，而用户程序使用高地址空间。
 
 这一部分需要你提交一份记录了**你的主要工作** 的实验报告。
+
+
+
+## Lab3 用户进程
+
+在这一个Lab中你会了解ARMv8的异常模型，以及一个简单的用户程序使用系统调用输出字符。
+
+### ARMv8 的异常模型
+
+ARMv8共设计了4个异常级别（忽略Secure特性），分别是：
+
+* EL0 用户的应用程序（用户态）
+* EL1 操作系统内核（内核态）
+* EL2 Hypervisor 虚拟化监视器（支持处理器核心的虚拟化）
+* EL3 安全监视器，（支持安全状态）
+
+在本操作系统实验中你仅需要使用到前两个EL。
+
+一般而言处理器从用户态陷入内核态是需要一些条件的，比如内部因素的处理器异常（异常指令，对齐问题等）、特权指令（系统调用）、外部中断。而且处理器也设计了中断向量表来区分这各种因素，并跳转到一个指定的处理函数。在ARMv8中，处理器使用的中断向量表的一个例子（取自Linux内核`arch/arm64/kernel/entry.S`）如下：
+
+````assembly
+/*
+ * Exception vectors.
+ */
+	.pushsection ".entry.text", "ax"
+
+	.align	11
+ENTRY(vectors)
+	kernel_ventry	1, sync_invalid			// Synchronous EL1t
+	kernel_ventry	1, irq_invalid			// IRQ EL1t
+	kernel_ventry	1, fiq_invalid			// FIQ EL1t
+	kernel_ventry	1, error_invalid		// Error EL1t
+
+	kernel_ventry	1, sync				// Synchronous EL1h
+	kernel_ventry	1, irq				// IRQ EL1h
+	kernel_ventry	1, fiq_invalid			// FIQ EL1h
+	kernel_ventry	1, error			// Error EL1h
+
+	kernel_ventry	0, sync				// Synchronous 64-bit EL0
+	kernel_ventry	0, irq				// IRQ 64-bit EL0
+	kernel_ventry	0, fiq_invalid			// FIQ 64-bit EL0
+	kernel_ventry	0, error			// Error 64-bit EL0
+
+#ifdef CONFIG_COMPAT
+	kernel_ventry	0, sync_compat, 32		// Synchronous 32-bit EL0
+	kernel_ventry	0, irq_compat, 32		// IRQ 32-bit EL0
+	kernel_ventry	0, fiq_invalid_compat, 32	// FIQ 32-bit EL0
+	kernel_ventry	0, error_compat, 32		// Error 32-bit EL0
+#else
+	kernel_ventry	0, sync_invalid, 32		// Synchronous 32-bit EL0
+	kernel_ventry	0, irq_invalid, 32		// IRQ 32-bit EL0
+	kernel_ventry	0, fiq_invalid, 32		// FIQ 32-bit EL0
+	kernel_ventry	0, error_invalid, 32		// Error 32-bit EL0
+#endif
+END(vectors)
+````
+
+这里的`kernel_ventry`是一个汇编宏`.macro kernel_ventry, el, label, regsize = 64` 。
+
+如此列举的一共有4组的异常向量，简单的说用途分别是“不应该发生”、EL1异常陷入EL1处理、EL0异常陷入EL1处理、32位相关的陷入。在本实验中你可能需要填充中间的两组异常向量。
+
+> 请思考什么时候会发生EL1异常并陷入EL1来处理EL1的异常的情况？
+
+每组内各有4个跳转`label`，分别是Sync（同步错误）、IRQ（中断请求）、FIQ（快速中断）和Error（系统错误），后文再继续介绍它们的用途。
+
+你可能注意到了向量的顶部有一个对齐的Assembly Directive `.align 11`  是期望这个向量的基地址的后11位为0，也就是2KB对齐。处理器设计也要求每个向量的代码`.text`也满足一定的对齐要求。
+
+> 请查阅相关资料或代码，自行撰写一个满足对齐要求的简单的中断向量
+
+完成中断向量后，需要将这个向量载入到`vbar_el1`寄存器中。
+
+Sync 同步错误中包括了实验中常见的两类情况：1. 缺页错误（Page Fault）2. 系统调用（System Call）。处理器在设计时使用了一个`esr_el1`寄存器来更细节的描述一个异常的“症状”，在缺页错误中，寄存器`far_el1`会记录发生错误的虚拟地址。
+
+> 请查阅 ESR_EL1 寄存器的设计，撰写区分缺页错误和系统调用的代码。
+
+IRQ 中断请求中包括了时钟中断，后文将介绍一个使用内置时钟的方法。
+
+FIQ在实验中可能是用不到的；Error会在一些指令违例等情况出现。
+
+### 时钟中断
+
+因为仿真器不具有使用博通SoC的时钟的功能，所以只能使用处理器内部的核心时钟，一般称为Generic Timer。
+
+这种内部时钟可以使用系统寄存器存取的方式（msr/mrs）来控制（当然也可以使用内存空间总线的方式）。这里涉及的系统寄存器有：
+
+* CNTP_CTL_EL0 控制寄存器
+* CNTP_TVAL_EL0 计数寄存器
+* CNTP_CVAL_EL0 比较寄存器
+* CNTFRQ_EL0 时钟频率
+
+一个参考的控制位设定（来源ARM内核驱动），其字面意思可以帮助理解含义：
+
+````c
+#define ARCH_TIMER_CTRL_ENABLE		(1 << 0)
+#define ARCH_TIMER_CTRL_IT_MASK		(1 << 1)
+#define ARCH_TIMER_CTRL_IT_STAT		(1 << 2)
+````
+
+一般的操作是向TVAL中填入一个值，则会触发一个Countdown的计数器模式，在启用控制寄存器后则会倒计时。如果期望的是一个具体的物理时间，则需要取出时钟频率寄存器的值，手动计算期望的寄存器的值。
+
+> 请完成时钟相关的函数，并验证可用性。
+
+你可以在启用计时器后轮询控制寄存器，观察其STAT位的值变化。当STAT为高位时，计时器处于异常状态。这个时候计时器的中断请求总线已经向中断控制器发出请求了，但是这个时候并没能观测到期望的时钟中断的软件过程。而很明显时钟内置的中断屏蔽位是0，问题可能出在树莓派的中断控制器的设置，或者处理器的状态位（DAIF）设置。
+
+树莓派的中断控制器是一组内存总线上的寄存器，可以参照文档（<https://www.raspberrypi.org/documentation/hardware/raspberrypi/bcm2836/QA7_rev3.4.pdf>）
+
+虽然这是树莓派2B的文档，但是大部分的内存IO总线上的寄存器和设备都是和树莓派3B相同的。
+
+> 请寻找到合适的中断控制器设定，并启用时钟的中断。
+>
+> 在从EL2回落到EL1时，需要设置`spsr_el2`寄存器，寄存器的内容在异常返回（ERET）后会复制到PSTATE寄存器状态寄存器，请保证中断不被屏蔽。
+
+到这里你应该可以看到期望的时钟中断的出现了。这里的时钟像是“一次性”的，并不会周期出现，你可以在每次调度进程后重启时钟的倒计时就能够实现进程的轮转了。
+
+
+
+### 用户程序
+
+这里需要你自行编译两个（一个输出a，一个输出b之类的）用户程序，并在内核启动时加载这两个程序。
+
+这里提供一个简易的用户程序代码：
+
+````c
+int put_character(int no, char c) {
+    __asm__ __volatile__ (
+    "svc #0"
+    );
+}
+
+int main() {
+    while (1) {
+        put_character(0, 'a');
+    }
+    return 0;
+}
+````
+
+可以看到用户进程是通过SVC指令来陷入内核态的，这里仿照的是MIPS实验的系统调用格式，所以第一个参数是系统调用号。因为ARMv8的通用寄存器众多，参数可以都只使用寄存器传参。
+
+可以直接用同样的工具链，将这个无任何依赖的C代码编译成ELF镜像，在链接时需要指定程序入口为main。
+
+至于如何让内核载入用户的程序，这一点仅给出几个思路：
+
+* 将ELF镜像转换成MIPS实验中的数组的形式
+* 通过UART输入传送镜像
+* 通过存取SD卡（需要实现SD卡相关的驱动）读取扇区
+
+
+
+到此为止可能还需要一些剩余的工作TODO：
+
+* 一个64位的ELF Loader（`kernel_elfloader.c`）
+* 页表遍历的函数的修改（`env_free`）
+* 现场保存和恢复
+* TLB刷新
+* ……
+
+
+
+这一部分需要你提交一份记录了**你的主要工作** 的实验报告。
+
+
+
