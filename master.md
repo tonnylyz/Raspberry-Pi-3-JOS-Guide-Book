@@ -172,7 +172,48 @@ qemu-system-aarch64 -M raspi3 -serial stdio -kernel kernel8.img
 
 >正如前面所提到的，树莓派3B使用的是一个四核心的处理器。首先明确一个概念，拥有多个核心的处理器每个核心拥有自己的一组寄存器，Cache 各级的共用情况不同，主存是共用的。按照推断，当内核镜像载入到主存后，四个核心都从同样的 PC 开始执行，若不做处理，在遇到对主存互斥的访问时会出现不可预知的问题。请寻找解决这一问题的方法。
 
-虽然这是一个号称Bare-Metal的实验，但是其重点并不在于实现硬件驱动，你可以借助其他人的代码来完成“自己的”串口通信驱动。
+虽然这是一个号称Bare-Metal的实验，但是其重点并不在于实现硬件驱动，这里提供简单的初始化UART以及一个输出字符所需要的代码（这一驱动实现的源码来源：https://github.com/bztsrc/raspi3-tutorial/tree/master/05_uart0）。
+
+````c
+#define UART0_IBRD      ((volatile u_int*)(0x3F201024))
+#define UART0_FBRD      ((volatile u_int*)(0x3F201028))
+#define UART0_LCRH      ((volatile u_int*)(0x3F20102C))
+#define UART0_CR        ((volatile u_int*)(0x3F201030))
+#define UART0_ICR       ((volatile u_int*)(0x3F201044))
+#define GPFSEL1         ((volatile u_int*)(0x3F200004))
+#define GPPUD           ((volatile u_int*)(0x3F200094))
+#define GPPUDCLK0       ((volatile u_int*)(0x3F200098))
+#define UART0_DR        ((volatile u_int*)(0x3F201000))
+#define UART0_FR        ((volatile u_int*)(0x3F201018))
+
+void uart_init() {
+    register unsigned int r;
+    *UART0_CR = 0;
+    r = *GPFSEL1;
+    r &= ~((7 << 12) | (7 << 15)); // gpio14, gpio15
+    r |= (4 << 12) | (4 << 15);    // alt0
+    *GPFSEL1 = r;
+    *GPPUD = 0;            // enable pins 14 and 15
+    r = 150;
+    while (r--) { asm volatile("nop"); }
+    *GPPUDCLK0 = (1 << 14) | (1 << 15);
+    r = 150;
+    while (r--) { asm volatile("nop"); }
+    *GPPUDCLK0 = 0;        // flush GPIO setup
+    *UART0_ICR = 0x7FF;    // clear interrupts
+    *UART0_IBRD = 2;       // 115200 baud
+    *UART0_FBRD = 0xB;
+    *UART0_LCRH = 0b11 << 5; // 8n1
+    *UART0_CR = 0x301;     // enable Tx, Rx, FIFO
+}
+
+void uart_send(unsigned int c) {
+    do { asm volatile("nop"); } while (*UART0_FR & 0x20);
+    *UART0_DR = c;
+}
+````
+
+
 
 这一部分需要你提交一份记录了**你的主要工作** 的实验报告。
 
@@ -198,6 +239,225 @@ qemu-system-aarch64 -M raspi3 -serial stdio -kernel kernel8.img
 对于相关寄存器的设置，我们的建议是请仔细查阅文档来完成**你自己的**MMU设置，你甚至可以设置自己的页表级数、页面大小。通常来说Aarch64处理器会忽略最高的一字节（`[63:56]`）的地址翻译，而一般实际可用的物理地址线也只有40根。
 
 一般来说越高的异常级别拥有越高的权限，而一般的无虚拟化的操作系统是运行在EL1下的，而很显然是不可能在EL1或者更低的异常级别设置EL1的处理器相关设置，这也是为什么是上电启动到EL2的原因。
+
+#### MMU 设置（仅供参考）
+
+这里给出一个MMU的设置过程例子，请设计并实现自己的内存地址翻译方案。
+
+**Step 1 设置间接内存属性寄存器**
+
+Memory Attribute Indirection Register, EL1
+
+Purpose: Provides the memory attribute encodingscorresponding to the possible AttrIndx values in a Long-descriptor formattranslation table entry for stage 1 translations at EL1.
+
+简言之就是用这个通过设置这个“数组”的内容，往后的地址翻译中的页表标志位则是根据这个表的下标（AttrIndx）来定位。
+
+（ARMCortex-A53 MPCore Processor Technical Reference Manual 4-109）
+
+![MMU](img/mmu-1.png)
+
+这个“数组”寄存器一共提供了8组，也就是能设置8种类型的内存。每一个设置项有8位，其设置的位参考：
+
+![MMU](img/mmu-2.png)
+
+![MMU](img/mmu-3.png)
+
+其中RW两位指的是cache的读时分配（read-allocate）和写时分配（write-allocate）。
+
+一些概念的说明：
+
+1.        inner和outer指的是多核心下的问题，此处不需要考虑，内外相同即可；
+
+
+2.        transient和non-transient为cache的存留时间问题，此处不需要考虑，都设置为non-transient（cache内容更倾向于长时间驻留）；
+3.        Write-through和Write-back是cache的写策略，分别是写通达和写回，都设置为Write-through；
+4.        GRE指的是设备内存区域访问的三种特性，A53中“仅有”nGnRE和GRE，一般对于外设的IO设置为nGnRE；
+
+此处我们设置3种类型：
+
+| #    | AttrIndx | Attr<n>[7:4] | Attr<n>[3:0] | 用途            |
+| ---- | -------- | ------------ | ------------ | --------------- |
+| 1    | 0        | 0b1000       | 0b1000       | 普通内存        |
+| 2    | 1        | 0b0000       | 0b0100       | 设备，nGnRE     |
+| 3    | 2        | 0b0100       | 0b0100       | non-cache的内存 |
+
+计算得到的mair_el1寄存器值：`0x440488`
+
+````assembly
+msr mair_el1, #0x440488
+````
+
+页表项的标志位中则可以定义这三种内存类型的宏：
+
+````c
+#define PTE_NORMAL (0 << 2)
+#define PTE_DEVICE (1 << 2)
+#define PTE_NON_CACHE (2 << 2)
+````
+
+**Step 2 设置翻译控制寄存器**
+
+Translation Control Register, EL1
+
+Purpose: Determines which Translation Base Registers definesthe base address register for a translation table walk required for stage 1translation of a memory access from EL0 or EL1 and holds cacheability andshareability information.
+
+（ARMCortex-A53 MPCore Processor Technical Reference Manual 4-81）
+
+简言之就是设置地址翻译过程的设置寄存器。
+
+![MMU](img/mmu-4.png)
+
+| 位      | 值    | 说明                  | 位      | 值   | 说明                  |
+| ------- | ----- | --------------------- | ------- | ---- | --------------------- |
+| [38]    | 1     | 忽略最高的一字节      | [23]    | 0    | 使用TTBR1_EL1         |
+| [37]    | 1     | 忽略最高的一字节      | [22]    | 0    | TTBR0_EL1使用ASID     |
+| [36]    | 0     | 8-bit ASID            | [21:16] | 0d25 | *25位高地址掩码Kern   |
+| [35]    | 0     | 保留                  | [15:14] | 0b00 | 4KB页面大小User       |
+| [34:32] | 0b000 | 32-bit物理内存总线    | [13:12] | 0b11 | *Inner Shareable User |
+| [31:30] | 0b10  | 4KB页面大小Kern       | [11:10] | 0b10 | *Cacheability O/User  |
+| [29:28] | 0b11  | *Inner Shareable Kern | [9:8]   | 0b10 | *Cacheability I/User  |
+| [27:26] | 0b10  | *Cacheability O/Kern  | [7]     | 0    | 使用TTBR1_EL0         |
+| [25:24] | 0b10  | *Cacheability I/Kern  | [6]     | 0    | 保留                  |
+|         |       |                       | [5:0]   | 0d25 | *25位高地址掩码Kern   |
+
+约定使用TTBR1_EL1用于内核的地址空间（高位），TTBR0_EL1用于用户进程的地址空间（低位）。
+
+一个三级页表设计（64-25=39位VA）
+
+| 63           40 | 39         31 | 30        21 | 20         12 | 11          0 |
+| --------------- | ------------- | ------------ | ------------- | ------------- |
+| 高位掩码25’     | 三级页表9’    | 二级页表9’   | 一级页表9’    | 页内偏移12’   |
+
+计算得到的tcr_el1寄存器值：`0x60BA193A19`
+
+````assembly
+msr tcr_el1, #0x60BA193A19
+isb
+````
+
+按*：ISB指令用于清空处理器流水线中的指令，在进程切换，更新TLB设置等操作时需要保证修改效果能够生效。
+
+**Step 3 准备内核页目录**
+
+1.        首先分配一个页面的空间`boot_alloc`，并且清空`boot_bzero`；
+2.        首先需要将所有的物理内存和MMIO（设备占用的地址空间）映射`boot_map_segment`到内核使用的页表中：
+
+因为不可避免的（照顾到32位系统），所以有大约16MB的内存牺牲给了设备占用的地址空间（`0x3F00 0000 ~ 0x3FFF FFFF`）；这时将`0x00000000 ~ 0x3EFF FFFF`的物理内存映射为普通内存（`PTE_NORMAL`），将设备地址空间映射为设备（`PTE_DEVICE`）。
+
+同时需要实现一个函数`boot_pgdir_walk`以便为各级页表分配物理内存空间。
+
+（ARMCortex-A Series Programmer’s Guide for ARMv8-A 13-11）
+
+![MMU](img/mmu-5.png)
+
+给出一些页表的标志位：
+
+````c
+#define PTE_PAGE 0b11 //4KB的粒度（同理有其他粒度）
+````
+
+AP(Access Permission)标志位[7:6]
+
+````c
+#define PTE_KERN (0 << 6) // 仅EL1+访问
+#define PTE_USER (1 << 6) // EL0+可访问
+#define PTE_RW (0 << 7) // 读写
+#define PTE_RO (1 << 7) // 只读
+````
+
+AF(Access Flag)标志位[10]
+
+````c
+#define PTE_AF (1 << 10) // *用户控制的可访问标识（AccessFlag）
+````
+
+PXN/UXN标志位[53]/[54]
+
+````c
+#define PTE_PXN (1UL << 53) // 不可执行标记（PrivilegedExecute-Never）
+#define PTE_UXN (1UL << 54) // EL0不可执行标记（Unprivileged Execute-Never）
+````
+
+Indx MAIR中的AttrIndx [4:2]
+
+SH 共享标记
+
+````c
+#define PTE_OUTER_SHARE (2 << 8) // 外部共享（核心Cluster间）需要给设备内存标记
+#define PTE_INNER_SHARE (3 << 8) // 内部共享（Cluster内）需要给普通内存标记
+````
+
+按：用户控制的可访问标识相当于一个不强制的标识位与标准实验中的PTE_V不同，控制位会导致缺页中断，但是并不会真的影响是否能存取，仅会影响TLB行为和异常行为。
+
+**Step 4 设置页表基地址寄存器**
+
+Translation Table Base Register 1, EL1
+
+````assembly
+msr ttbr1_el1, KSTACKTOP
+````
+
+建议一开始将ttbr0_el1也设置为同样的页目录地址，方便初始化。
+
+**Step 5 设置系统控制寄存器**
+
+System Control Register, EL1
+
+Purpose: Provides top level control of the system, includingits memory system at EL1.
+
+简言之是总的控制处理器行为的寄存器。
+
+（ARMCortex-A Series Programmer’s Guide for ARMv8-A 4-50）
+
+![MMU](img/mmu-6.png)
+
+| 位   | 值     | 位   | 值     | 位   | 值     | 位   | 值     |
+| ---- | ------ | ---- | ------ | ---- | ------ | ---- | ------ |
+| 31   | 0 保留 | 23   | 1 保留 | 15   | 0 X*   | 7    | 0 X*   |
+| 30   | 0 保留 | 22   | 1 保留 | 14   | 0 X*   | 6    | 0 保留 |
+| 29   | 1 保留 | 21   | 0 保留 | 13   | 0 保留 | 5    | 1 X*   |
+| 28   | 1 保留 | 20   | 1 保留 | 12   | 1 I*   | 4    | 0 SA0* |
+| 27   | 0 保留 | 19   | 0 WXN* | 11   | 1 保留 | 3    | 0 SA*  |
+| 26   | 0 X*   | 18   | 1 X*   | 10   | 0 保留 | 2    | 1 C*   |
+| 25   | 0 EE*  | 17   | 0 保留 | 9    | 0 UMA* | 1    | 0 A*   |
+| 24   | 0 E0E* | 16   | 1 X*   | 8    | 0 X*   | 0    | 1 M*   |
+
+X*：不予说明；
+
+EE*：EL1及页表尾端little Endian（0）；
+
+E0E*：EL0尾端little Endian（0）；
+
+WXN*：可写区域不可执行，并不启用这一特性（0）；
+
+I*：指令Cache启用（1）；
+
+UMA*：禁止用户态访问中断屏蔽寄存器（0）；
+
+SA0*：禁用EL0的栈对齐检查（0）；
+
+SA*：禁用栈指针SP的对齐检查（0）；
+
+C*：启用数据cache（1）；
+
+A*：禁用对齐检查（0）；
+
+M*：启用MMU（1）。
+
+计算得到sctlr_el1寄存器的值：`0x30d51825`
+
+````assembly
+msr sctlr_el1, #0x30d51825
+isb
+````
+
+**Step Finish 完成**
+
+做完上述过程树莓派的MMU就已经可以启动啦，之后通过将地址设置为高位来访问设备的地址空间。同时这里也需要将main函数链接到一个高地址位置。
+
+ 
+
+在启动前可能需要排除一些问题，树莓派启动时不一定处于EL1状态，甚至会出现EL3的状态。对于我们这个不涉及虚拟化的操作系统实验只会使用到EL0和EL1状态。需要在启动时回落到EL1状态。
 
 对于回落到EL1的过程，这里给出一段参考代码，但是不保证能够达到你的期望效果，请仔细查阅相关处理器文档做出合适的修改并应用在你的代码中：
 
@@ -405,5 +665,99 @@ int main() {
 
 这一部分需要你提交一份记录了**你的主要工作** 的实验报告。
 
+## Lab4 系统调用/进程通信
+
+从这个实验开始，树莓派分支和MIPS分支的差异会越来越小。所以指导书会侧重于讲解一些中要的实现问题，而不是一个流程化的说明。
+
+**一个完整的用户Fork的实现**
+
+这里提到了“完整的”的这个概念，也就是说不希望用同等效用的其他实现方式来实现fork，主要的要点有：
+
+1. 不应该实现一个内核的系统调用的fork（不增加系统调用）
+2. 实现一种机制来遍历进程内存空间（类似于`vpd/vpt`的实现）
+3. 实现一个由用户态处理自身进程的缺页中断的机制（Copy on Write机制的用户态实现）
+4. 实现在用户态下恢复`Trapframe`并回到正常状态的机制
+
+**应用程序访问自身页表** 
+
+在MIPS实验中，为进程初始化虚拟内存有这样的代码：
+
+````c
+e->env_pgdir[PDX(UVPT)] = e->env_cr3 | PTE_V | PTE_R;
+````
+
+你可以尝试直接在树莓派中实现“类似”的自映射设计，并观察结果。
+
+实际上，当尝试在用户态使用vpd指针访问页表的物理页时，是直接存取物理内存的（请在MIPS实验中观测这一点），直观的想，这种插入页目录的表项的行为至多能够使得页目录的物理页（4KB）能够直接存取，而其他的页表的物理页是不可能通过“合法”的方式访问的，因此这种设计是不可行的。
+
+所以这里的建议做法是自行完成所有页表的物理页的用户地址空间映射。在不实现自映射设计时可以在用户空间为各级页表空间预留一个区域，如：
+
+````c
+#define UVPD                0x7040200000UL
+#define UVPM                0x7040000000UL
+#define UVPT                0x7000000000UL
+````
+
+将页目录的物理页映射到`UVPD`处：
+
+````c
+page_insert(e->env_pgdir, pa2page(PADDR(e->env_pgdir)), UVPD, PTE_USER | PTE_RO);
+````
+
+此处需要注意权限设置，用户是不应该具有写入页表的能力的。
+
+>  接下来就是中间级页表空间和页表空间的映射问题了，请找到为页表申请物理页的位置，并在“当时”将物理页映射到合适的位置来访问。
+
+在完成映射后就能够访问自身进程的页表空间了，和MIPS实验不同的是，这里实现的是每一个页面的映射，不再尝试访问页表项里的地址，所以可以通过类似这样的方式遍历地址空间：
+
+````c
+extern unsigned long *vpt, *vpm, *vpd;
+
+for (i = 0; i < 512; i++) {
+    if (vpd[i] == 0) continue;
+    for (j = 0; j < 512; j++) {
+        if (vpm[i * 512 + j] == 0) continue;
+        for (k = 0; k < 512; k++) {
+            pte = vpt[i * 512 * 512 + j * 512 + k];
+            if (pte == 0) continue;
+            va = (i * 512 * 512 + j * 512 + k) << PGSHIFT;
+            // Do something here!
+        }
+    }
+}
+````
+
+> 请思考这样的一个问题，如果通过增加一个系统调用来“查询”自身进程的页表项会带来哪些问题？从安全方面，代价方面考虑这个问题。
 
 
+
+**COW的用户态处理**
+
+当发生缺页中断时，系统陷入内核态，内核通过鉴别一个同步（`sync`）错误的种类，来捕获特定的缺页中断，进入一个内核的处理函数。
+
+> 请查阅处理器文档，找到缺页中断对应的错误编号（Exception Class），并将缺页中断导向一个内核handle。
+
+这里内核可以通过系统寄存器`far_el1`来获得发生缺页中断的地址，在进程为自身设置了`set_pgfault_handler`的前提下（也就是在`env`的`env_pgfault_handler`域非空），系统在判别这是不是一个尝试写入“只读”的COW页面的操作，如果是则需要直接通过设置`elr`和`sp`寄存器，分别为处理函数地址和异常处理栈指针（`XSTACKTOP`），使得此处能够返回到用户定义的缺页中断的处理函数。此处还需要传递发生缺页错误的地址信息。
+
+用户进程设置了一个`__asm_pgfault_handler`的用户态处理缺页中断的过程。进入这一过程后，首先会调用`pgfault`函数，这个函数需要一个参数，也就是发生缺页中断的地址。从这一函数返回后则需要恢复进程原本的运行状态。
+
+
+
+**用户态恢复Trapframe**
+
+首先在内核捕获缺页时的Trapframe就应该是进程原本的运行状态，而异常返回后则会有信息被破坏。所以需要先行将Trapframe复制到一个“用户可见的“的位置，比如异常处理栈内：
+
+````c
+struct Trapframe *tf = (struct Trapframe *)(K_TIMESTACK_TOP - sizeof(struct Trapframe));
+bcopy(tf, (void *) (U_XSTACK_TOP - sizeof(struct Trapframe)), sizeof(struct Trapframe));
+````
+
+> 这个时候需要将返回的栈指针设置到一个合适的位置。在返回用户态，并通过`pgfault`函数处理完COW复制后，请撰写一段汇编代码尝试恢复现场。
+
+
+
+> 这里你可以观察MIPS实验的代码，恢复代码实现了一个”原子操作“，而这一特性的实现关键在于分支延时槽。但是很遗憾的是ARM设计并没有延时槽。同时因为受限于指令格式，不能直接通过`LDR`设置`pc/sp`寄存器，也就是必须使用一个数字编号的寄存器来作为”中间变量“，而这种做法也带来了新的问题。请查阅文档，利用一个”保留用途“的数字编号寄存器来完成这些操作。
+
+
+
+进程通信部分不需要过多的说明，这一部分需要你提交一份记录了**你的主要工作** 的实验报告。
