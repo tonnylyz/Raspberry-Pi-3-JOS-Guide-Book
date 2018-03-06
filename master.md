@@ -784,6 +784,8 @@ dd if=fs/fs.img of=sdcard.img seek=10000
 
 在使用仿真器加载时，需要添加参数`-drive file=sdcard.img,format=raw`。此处的扇区偏移不是必须的，因为内核读取并不依赖于FAT分区，你可以直接将`fs.img`放在`sdcard.img`的头部，或者直接使用`fs.img`作为磁盘镜像。
 
+> 请注意文件系统镜像的字节序（Endian）的问题，这里的设定也和处理器MMU设置相关，你可能需要修改代码生成期望的文件系统镜像。
+
 > Windows系统下的WSL并没有USB块设备的文件描述符实现，所以如果你使用的是Windows操作系统而又希望写入物理SD卡，你可以尝试使用dd for windows （http://www.chrysocome.net/dd）。这里没有任何保证，请谨慎操作。
 
 至于如何在用户态下访问设备IO的地址空间这里给出两种典型的方案：
